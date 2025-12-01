@@ -1,54 +1,120 @@
 import os
 import logging
-import requests
-from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
+import time
+import schedule
+import html
+from dotenv import load_dotenv
+from telegram import Bot
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
-# Включаем логирование
+import scraper
+import db_manager
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+CHECK_INTERVAL_MINUTES = 15
+
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")  # Токен из GitHub Secrets
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # ID или @username канала из Secrets
+async def send_to_telegram(bot, news_item):
+    """Sends a formatted news message to Telegram."""
+    title = news_item['title']
+    url = news_item['url']
+    summary = news_item.get('summary', '')
 
-NEWS_URL = "https://tengrinews.kz"
+    # Escape HTML special characters to avoid parsing errors
+    safe_title = html.escape(title)
+    safe_summary = html.escape(summary)
 
-# Парсинг новостей
-def get_news():
-    response = requests.get(NEWS_URL)
-    soup = BeautifulSoup(response.text, "html.parser")
-    headlines = soup.select(".content_main_item_title a")[:5]  # первые 5 новостей
-    news_list = []
-    for h in headlines:
-        title = h.get_text(strip=True)
-        link = NEWS_URL + h["href"]
-        news_list.append(f"{title}\n{link}")
-    return "\n\n".join(news_list)
+    # HTML formatting
+    message = f"<b>{safe_title}</b>\n\n{safe_summary}\n\n<a href='{url}'>Читать далее</a>"
 
-# Команда /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот, который будет присылать новости в канал.")
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode=ParseMode.HTML)
+        logger.info(f"Sent: {title}")
+        db_manager.mark_as_published(url)
+    except TelegramError as e:
+        logger.error(f"Failed to send message: {e}")
 
-# Команда /news
-async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    news_data = get_news()
-    await update.message.reply_text(news_data)
+async def process_news(bot):
+    """Fetches, filters, and sends news."""
+    logger.info("Starting news check cycle...")
 
-# Автопостинг в канал
-async def post_news_to_channel(app):
-    news_data = get_news()
-    await app.bot.send_message(chat_id=CHANNEL_ID, text=news_data)
+    all_news = []
+
+    # 1. Fetch RSS News
+    try:
+        rss_news = scraper.fetch_rss_news()
+        all_news.extend(rss_news)
+    except Exception as e:
+        logger.error(f"Error fetching RSS news: {e}")
+
+    # 2. Fetch Web News
+    # Note: Using a test URL or the one from original code.
+    # Tengrinews was used in original code, so keeping it as default in scraper.py
+    try:
+        web_news = scraper.fetch_web_news()
+        all_news.extend(web_news)
+    except Exception as e:
+        logger.error(f"Error scraping web news: {e}")
+
+    # 3. Filter and Send
+    for news_item in all_news:
+        url = news_item.get('url')
+        if not url:
+            continue
+
+        if not db_manager.is_published(url):
+            await send_to_telegram(bot, news_item)
+            # Sleep briefly to avoid hitting rate limits
+            await asyncio.sleep(1)
+        else:
+            logger.debug(f"Skipping already published: {url}")
+
+def job():
+    """Wrapper for the scheduled job to run async code."""
+    # Since schedule is synchronous, we need to run the async function
+    # We create a new event loop for this run or use an existing one if appropriate.
+    asyncio.run(run_job_async())
+
+async def run_job_async():
+    bot = Bot(token=TOKEN)
+    await process_news(bot)
+
+def main():
+    if not TOKEN or not CHANNEL_ID:
+        logger.error("Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID not set in .env")
+        logger.error("Please create a .env file with these variables.")
+        return
+
+    # Initialize Database
+    db_manager.init_db()
+
+    # Schedule the job
+    logger.info(f"Scheduling news check every {CHECK_INTERVAL_MINUTES} minutes.")
+    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(job)
+
+    # Run immediately once on startup
+    try:
+        job()
+    except Exception as e:
+        logger.error(f"Error during initial job run: {e}")
+
+    # Main loop
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("news", news))
-
-    # Пример: при запуске сразу отправляем новости в канал
-    app.job_queue.run_once(lambda ctx: post_news_to_channel(app), 5)
-
-    app.run_polling()
+    main()
